@@ -1,48 +1,27 @@
 const express = require('express');
-const http = require('http');
 const swaggerUi = require('swagger-ui-express');
 const swaggerSpec = require('./swagger');
 const { query } = require('./db');
 const { ensureDefaultAdmin, login, authenticate, requireRole, createAccount } = require('./auth');
+const { router: gatewayRouter, COMMAND_TYPE_BY_FC } = require('./gateway');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const GATEWAY_HOST = process.env.GATEWAY_HOST || '127.0.0.1';
-const GATEWAY_HTTP_PORT = parseInt(process.env.GATEWAY_HTTP_PORT || '3001', 10);
-const DEVICE_HOST = process.env.DEVICE_HOST || '127.0.0.1';
-const DEVICE_PORT = parseInt(process.env.DEVICE_PORT || '3002', 10);
+// 운전/정지 같은 단발 명령의 기본 만료(초). dial-in 주기를 고려해 큐에서 만료시킨다.
+const COMMAND_TTL_SEC = parseInt(process.env.COMMAND_TTL_SEC || '3600', 10);
 
 app.use(express.json());
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Gateway-Key');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
-// 작은 HTTP 요청 헬퍼 (gateway/device 프록시용)
-function httpPost(host, port, path, body) {
-  return new Promise((resolve, reject) => {
-    const payload = JSON.stringify(body || {});
-    const req = http.request(
-      { host, port, path, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } },
-      (res) => {
-        let data = '';
-        res.on('data', (c) => (data += c));
-        res.on('end', () => {
-          let parsed = {};
-          try { parsed = JSON.parse(data); } catch { /* noop */ }
-          resolve({ status: res.statusCode, data: parsed });
-        });
-      },
-    );
-    req.on('error', reject);
-    req.write(payload);
-    req.end();
-  });
-}
+// IECP Gateway 전용 라우터 (X-Gateway-Key 인증). 일반 사용자 API 와 분리.
+app.use('/api/v1/gateway', gatewayRouter);
 
 // ── 헬스 ──────────────────────────────────────────────────────────────────────
 /**
@@ -267,8 +246,10 @@ app.get('/api/devices/:deviceId/data', async (req, res) => {
   params.push(limit);
   try {
     const { rows } = await query(
-      `SELECT device_id, status_datetime, received_at, pt_cur, pt_b, p_con, pe_cur,
-              operation_status, operation, remain_time_minutes, remain_time_seconds, status_code
+      `SELECT device_id, device_type, status_datetime, received_at, pressure, temperature,
+              battery_voltage, rssi, operation_status, operation_mode, calc_pressure, prev_pressure,
+              init_pressure, set_pressure, control_action, remain_minutes, remain_seconds,
+              motor_position, status_code, status
        FROM device_data WHERE device_id = $1 ${extra}
        ORDER BY received_at DESC LIMIT $${params.length}`,
       params,
@@ -460,24 +441,94 @@ app.post('/api/devices/:deviceId/control', authenticate, requireRole('admin', 'o
     return res.status(400).json({ error: 'VALIDATION_ERROR', message: "operation 은 '1'(운전) 또는 '2'(정지)" });
   }
   try {
-    // 운전 명령이면 시뮬레이터 자동 기동 (TCP 세션 확보)
-    if (operation === '1') {
-      try {
-        await httpPost(DEVICE_HOST, DEVICE_PORT, `/api/devices/${deviceId}/start`, {});
-        await new Promise((r) => setTimeout(r, 1000));
-      } catch { /* 기동 실패해도 진행 */ }
-    }
-    const gw = await httpPost(GATEWAY_HOST, GATEWAY_HTTP_PORT, `/api/devices/${deviceId}/control`, { operation });
-    if (gw.status !== 200) {
-      if (gw.status === 404) return res.status(404).json({ error: 'DEVICE_NOT_FOUND', message: gw.data.message || 'device not connected' });
-      return res.status(gw.status).json(gw.data);
-    }
+    // 즉시 푸시가 아니라 명령 큐에 적재(pending). Gateway 가 polling 으로 가져가 장비에 전송.
+    const cmd = await enqueueCommand({
+      deviceId,
+      functionCode: '300',
+      payload: { requestType: '00', operation },
+      requestedBy: req.user.id,
+    });
     await query(
       `INSERT INTO audit_log (account_id, action, target_type, target_id, payload)
        VALUES ($1, 'device.control', 'device', $2, $3)`,
-      [req.user.id, deviceId, JSON.stringify({ operation })],
+      [req.user.id, deviceId, JSON.stringify({ operation, commandId: cmd.id })],
     );
-    res.json({ ok: true, data: { message: `제어 명령 전송: operation=${operation === '1' ? '운전' : '정지'}` } });
+    res.json({
+      ok: true,
+      data: {
+        commandId: cmd.id,
+        status: cmd.status,
+        message: `제어 명령 큐 적재: operation=${operation === '1' ? '운전' : '정지'}`,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'INTERNAL_ERROR', message: err.message });
+  }
+});
+
+// 명령 큐 적재 공통 헬퍼 — device_command 에 pending 으로 INSERT.
+async function enqueueCommand({ deviceId, functionCode, commandType, payload, requestedBy, priority, ttlSec }) {
+  const ct = commandType || COMMAND_TYPE_BY_FC[functionCode] || null;
+  const ttl = ttlSec || COMMAND_TTL_SEC;
+  const { rows } = await query(
+    `INSERT INTO device_command (device_id, function_code, command_type, payload, status,
+                                 priority, requested_by, expires_at, created_at)
+     VALUES ($1, $2, $3, $4::jsonb, 'pending', COALESCE($5, 5), $6, now() + ($7 || ' seconds')::interval, now())
+     RETURNING id, device_id, function_code, command_type, status, payload, created_at, expires_at`,
+    [deviceId, functionCode, ct, JSON.stringify(payload || {}), priority || null, requestedBy || null, String(ttl)],
+  );
+  return rows[0];
+}
+
+/**
+ * @swagger
+ * /api/v1/devices/{deviceId}/commands:
+ *   post:
+ *     summary: 장비 명령 큐 적재 (운전/설정/연간압력 등)
+ *     tags: [Control]
+ *     security: [{ bearerAuth: [] }]
+ *     parameters: [{ in: path, name: deviceId, required: true, schema: { type: string } }]
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema: { type: object, properties: { functionCode: { type: string }, commandType: { type: string }, payload: { type: object }, priority: { type: integer }, ttlSec: { type: integer } } }
+ *           example: { functionCode: '501', payload: { Pcon: 2.5, Pmax: 2.3, Pmin: 1.5 } }
+ *     responses: { 200: { description: ok } }
+ */
+app.post('/api/v1/devices/:deviceId/commands', authenticate, requireRole('admin', 'operator'), async (req, res) => {
+  const { deviceId } = req.params;
+  const { functionCode, commandType, payload, priority, ttlSec } = req.body || {};
+  if (!functionCode || !COMMAND_TYPE_BY_FC[functionCode]) {
+    return res.status(400).json({ error: 'VALIDATION_ERROR', message: `functionCode 는 ${Object.keys(COMMAND_TYPE_BY_FC).join('/')} 중 하나` });
+  }
+  try {
+    const cmd = await enqueueCommand({ deviceId, functionCode, commandType, payload, requestedBy: req.user.id, priority, ttlSec });
+    res.json({ ok: true, data: cmd });
+  } catch (err) {
+    res.status(500).json({ error: 'INTERNAL_ERROR', message: err.message });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/devices/{deviceId}/commands:
+ *   get: { summary: 장비 명령 큐/이력 조회, tags: [Control], parameters: [{ in: path, name: deviceId, required: true, schema: { type: string } }, { in: query, name: status, schema: { type: string } }], responses: { 200: { description: ok } } }
+ */
+app.get('/api/v1/devices/:deviceId/commands', async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+  const params = [req.params.deviceId];
+  let extra = '';
+  if (req.query.status) { params.push(req.query.status); extra = ` AND status = $${params.length}`; }
+  params.push(limit);
+  try {
+    const { rows } = await query(
+      `SELECT id, device_id, function_code, command_type, payload, status, transaction_id,
+              result_code, result_message, gateway_id, requested_by, expires_at, sent_at, completed_at, created_at
+       FROM device_command WHERE device_id = $1 ${extra}
+       ORDER BY created_at DESC LIMIT $${params.length}`,
+      params,
+    );
+    res.json({ ok: true, data: rows });
   } catch (err) {
     res.status(500).json({ error: 'INTERNAL_ERROR', message: err.message });
   }
@@ -492,7 +543,7 @@ app.get('/api/devices/:deviceId/commands', async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 500);
   try {
     const { rows } = await query(
-      'SELECT * FROM device_command WHERE device_id = $1 ORDER BY COALESCE(requested_at, sent_at) DESC LIMIT $2',
+      'SELECT * FROM device_command WHERE device_id = $1 ORDER BY created_at DESC LIMIT $2',
       [req.params.deviceId, limit],
     );
     res.json({ ok: true, data: rows });

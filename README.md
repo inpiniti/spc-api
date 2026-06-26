@@ -99,36 +99,43 @@ GET /api/alarms?limit=100
 GET /api/commands?limit=50
 ```
 
-#### 장비 제어 (운전/정지)
+#### 장비 제어 (운전/정지) — 명령 큐 방식
+
+> 제어는 즉시 푸시가 아니라 `device_command` 큐에 **pending 으로 적재**된다.
+> Gateway 가 `GET /api/v1/gateway/commands/poll` 로 가져가 장비 dial-in 시 전송하고,
+> 결과를 `PATCH /api/v1/gateway/commands/:id/result` 로 보고한다.
 
 ```bash
-# 운전
+# 운전(operation=1) 큐 적재  (JWT 필요)
 curl -X POST http://localhost:3000/api/devices/SPC0001/control \
-  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
   -d '{"operation":"1"}'
 
-# 정지
-curl -X POST http://localhost:3000/api/devices/SPC0001/control \
-  -H "Content-Type: application/json" \
-  -d '{"operation":"2"}'
+# 일반 명령(설정 501, 연간압력 502/503 등) 큐 적재
+curl -X POST http://localhost:3000/api/v1/devices/SPC0001/commands \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"functionCode":"501","payload":{"Pcon":2.5,"Pmax":2.3,"Pmin":1.5}}'
 ```
 
 **응답:**
 ```json
-{
-  "ok": true,
-  "message": "제어 명령 전송 성공: operation=운전",
-  "timestamp": "2026-05-19T12:05:30.000Z"
-}
+{ "ok": true, "data": { "commandId": 1001, "status": "pending", "message": "제어 명령 큐 적재: operation=운전" } }
 ```
 
-**오류 응답:**
-```json
-{
-  "error": "Device not found or not connected",
-  "message": "device not connected"
-}
-```
+## Gateway 연동 (X-Gateway-Key)
+
+IECP Gateway 전용 엔드포인트. 일반 사용자 JWT 와 분리된 `X-Gateway-Key` 헤더로 인증한다
+(`GATEWAY_KEY` 환경변수, spc-gateway 와 동일 값).
+
+| 메서드 | 경로 | 설명 |
+|--------|------|------|
+| GET | `/api/v1/gateway/commands/poll` | 대기 명령 polling (pending→sent, transactionId 부여) |
+| PATCH | `/api/v1/gateway/commands/:id/result` | 명령 실행 결과 보고 (sent→acked/failed) |
+| POST | `/api/v1/gateway/alarms` | 알람(701) 수신 → `device_alarm` INSERT |
+| POST | `/api/v1/gateway/device-status` | 장비 접속/해제 보고 → `device_connection` |
+| POST | `/api/v1/gateway/annual-pressure` | 연간 압력 업로드 수신(503, 365개) |
+
+상세 요청/응답은 `spc_gateway_postman_collection.json` 참고.
 
 #### 헬스 체크
 
